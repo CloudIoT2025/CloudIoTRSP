@@ -1,0 +1,10 @@
+{
+  "broker": "broker ip",
+  "port": "port",
+  "rspId": "12345",
+  "data_url":{
+    "1": "https://s3. ------ /1.json",
+    "2": "https://s3. ------ /2.json",
+    "3": "https://s3. ------ /3.json",
+  }
+}
