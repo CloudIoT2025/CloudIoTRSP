@@ -7,12 +7,11 @@ import numpy as np
 import logging
 import asyncio
 import threading
+import requests
 import mediapipe as mp
 from paho.mqtt import client as mqtt_client
 from fastdtw import fastdtw
-# test.py의 함수 불러오기 
-from bisect import bisect_left, bisect_right
-from scipy.spatial import procrustes
+# test.py의 함수 불러오기
 from pose_detect import (
     load_pose_data,
     compute_joint_amplitudes,
@@ -20,20 +19,22 @@ from pose_detect import (
     make_frame_dist,
     compute_seq_movement_vec,
     get_live_pose,
-    smooth_sequence
+    smooth_sequence,
+    bisect_left,
+    bisect_right
 )
 
 
-SIMILARITY_THRESHOLD      = 0.7      # 0~1, 이 이상이면 '수행'으로 간주
-DELAY_TOLERANCE_MS        = 300      # ms 단위 싱크 허용 오차
-PAST_WINDOW_MS            = 2000     # 과거 비교 윈도우 크기 (ms)
-FUTURE_WINDOW_MS          = 500      # 미래 비교 윈도우 크기 (ms)
-MIN_POSES_FOR_DTW         = 3        # DTW 적용 최소 프레임 수
-MIN_MOVEMENT_RATIO        = 0.2      # 참조 대비 라이브 이동량 비율 최소치
+SIMILARITY_THRESHOLD = 0.7      # 0~1, 이 이상이면 '수행'으로 간주
+DELAY_TOLERANCE_MS = 300      # ms 단위 싱크 허용 오차
+PAST_WINDOW_MS = 2000     # 과거 비교 윈도우 크기 (ms)
+FUTURE_WINDOW_MS = 500      # 미래 비교 윈도우 크기 (ms)
+MIN_POSES_FOR_DTW = 3        # DTW 적용 최소 프레임 수
+MIN_MOVEMENT_RATIO = 0.2      # 참조 대비 라이브 이동량 비율 최소치
 STATIC_MOVEMENT_THRESHOLD = 0.05     # 정적 구간 판단 임계 이동량
-TOP_K_JOINTS              = 20       # 사용할 상위 관절 개수
-WARMUP_MS                 = 5000     # 초반 5초(5000ms) 동안 결과는 최종 계산에서 제외
-SMOOTH_WINDOW_SIZE        = 5        # 보정용 윈도우 반경(프레임 수)
+TOP_K_JOINTS = 20       # 사용할 상위 관절 개수
+WARMUP_MS = 5000     # 초반 5초(5000ms) 동안 결과는 최종 계산에서 제외
+SMOOTH_WINDOW_SIZE = 5        # 보정용 윈도우 반경(프레임 수)
 
 # -------------------
 # 전역 상태 변수
@@ -48,15 +49,15 @@ try:
     with open(CONFIG_PATH, 'r') as f:
         cfg = json.load(f)
         BROKER = cfg.get('broker', 'localhost')
-        PORT   = cfg.get('port', 1883)
-        RSPID   = cfg.get('rspId', "None")
+        PORT = cfg.get('port', 1883)
+        RSPID = cfg.get('rspId', "None")
 except FileNotFoundError:
     raise SystemExit(f"설정 파일 '{CONFIG_PATH}'을(를) 찾을 수 없습니다.")
 except (json.JSONDecodeError, TypeError) as e:
     raise SystemExit(f"설정 파일 파싱 오류: {e}")
 
 # 구독할 토픽 (move/start/12345 하나만)
-TOPICS    = [('move/start/'+RSPID, 0)]
+TOPICS = [('move/start/'+RSPID, 0)]
 # 고유 클라이언트 ID 생성
 CLIENT_ID = f'rsp-{RSPID}'
 
@@ -67,7 +68,22 @@ logger.setLevel(logging.INFO)
 # -------------------
 # 비동기 함수 정의
 # -------------------
-async def async_test(client,data,rsp_id):
+
+
+def download_json_from_url(url: str, output_path: str) -> dict:
+    """
+    Download JSON file from a public or presigned S3 URL using HTTP GET.
+    Saves the JSON to output_path and returns the parsed data.
+    """
+    resp = requests.get(url)
+    resp.raise_for_status()
+    data = resp.json()
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return data
+
+
+async def detect_pose(client, data, rsp_id):
     global latest_async_data
     print(f"💡 Async test start with: {data}")
     # 예시로 2초 대기
@@ -76,52 +92,48 @@ async def async_test(client,data,rsp_id):
     # pos_data/ 에 move_num.json 존재하는지 확인
     if not os.path.exists(f'pose_data/{move_num}.json'):
         # 파일이 없으면 다운로드
-
-        #s3 url에 접속하여 pose_data/에 move_num.json으로 저장
-#  ========================================================================= 해야될꺼 ======================================================================================================================
-        # 예시로 pose_data.json 을 복사해서 사용
-        os.system(f'cp pose_data.json pose_data/{move_num}.json')
+        # s3 url에 접속하여 pose_data/에 move_num.json으로 저장
+        download_json_from_url(url, f'pose_data/{move_num}.json')
 
 #  =================  실제 pose 추정 비교 실행 ===============================
     # --- 초기 로드 & 벡터 변환 ---
     print(f"💡 Loading pose data from {move_num}.json")
-    cal,pose_data = load_pose_data(f'pose_data/{move_num}.json')
-    print(f"💡 Loaded {len(pose_data)} frames, {len(pose_data[0])} joints")
-    ms_list   = list(pose_data.keys())
-    amps      = compute_joint_amplitudes(pose_data)
-    weights   = compute_joint_weights(amps)
-    print(f"💡 Loaded {len(ms_list)} frames, {len(weights)} joints")
+    cal, pose_data = load_pose_data(f'pose_data/{move_num}.json')
+    ms_list = list(pose_data.keys())
+    amps = compute_joint_amplitudes(pose_data)
+    weights = compute_joint_weights(amps)
 
     # 상위 K개 관절 선택
-    top_joints = sorted(amps, key=lambda j: amps[j], reverse=True)[:TOP_K_JOINTS]
+    top_joints = sorted(amps, key=lambda j: amps[j], reverse=True)[
+        :TOP_K_JOINTS]
 
     # pose_data → 벡터 시퀀스 (각 frame: (K,3) 배열)
     pose_vecs = [
-        np.array([ pose_data[t].get(j, (0,0,0)) for j in top_joints ], dtype=float)
+        np.array([pose_data[t].get(j, (0, 0, 0))
+                 for j in top_joints], dtype=float)
         for t in ms_list
     ]
 
     # joint weights → 벡터, sqrt
-    w_vec  = np.array([ weights[j] for j in top_joints ], dtype=float)
+    w_vec = np.array([weights[j] for j in top_joints], dtype=float)
     w_sqrt = np.sqrt(w_vec)[:, None]   # (K,1) 모양
 
     frame_dist = make_frame_dist(w_sqrt)
 
     # 카메라 & Mediapipe 세팅
-    cap     = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(0)
     mp_pose = mp.solutions.pose
-    pose    = mp_pose.Pose(min_detection_confidence=0.5,
-                           min_tracking_confidence=0.5)
+    pose = mp_pose.Pose(min_detection_confidence=0.5,
+                        min_tracking_confidence=0.5)
 
-    start_ms   = int(time.time()*1000)
-    live_vecs  = []
+    start_ms = int(time.time()*1000)
+    live_vecs = []
     live_times = []
-    results    = []  # (time_ms, ok_flag) 기록
+    results = []  # (time_ms, ok_flag) 기록
 
-    result = client.publish('response/move/start/'+rsp_id, '1,'+userId, qos=2)
+    result = client.publish('response/move/start/'+rsp_id, '1', qos=1)
     if result.rc != mqtt_client.MQTT_ERR_SUCCESS:
         logger.error(f"❌ Publish failed (response): rc={result.rc}")
-
 
     try:
         while True:
@@ -139,7 +151,8 @@ async def async_test(client,data,rsp_id):
                 continue
 
             # live_pose → 벡터 변환
-            live_v = np.array([ lp.get(j, (0,0,0)) for j in top_joints ], dtype=float)
+            live_v = np.array([lp.get(j, (0, 0, 0))
+                              for j in top_joints], dtype=float)
             live_vecs.append(live_v)
             live_times.append(now_ms)
 
@@ -150,9 +163,9 @@ async def async_test(client,data,rsp_id):
 
             # 참조 시퀀스 인덱스 (과거+미래 윈도우)
             ref_start = now_ms - PAST_WINDOW_MS - DELAY_TOLERANCE_MS
-            ref_end   = now_ms + FUTURE_WINDOW_MS + DELAY_TOLERANCE_MS
+            ref_end = now_ms + FUTURE_WINDOW_MS + DELAY_TOLERANCE_MS
             start_i = bisect_left(ms_list, ref_start)
-            end_i   = bisect_right(ms_list, ref_end) - 1
+            end_i = bisect_right(ms_list, ref_end) - 1
             ref_seq = pose_vecs[start_i:end_i+1]
             live_seq = live_vecs
 
@@ -160,27 +173,30 @@ async def async_test(client,data,rsp_id):
                 continue
 
             # DTW 유사도 계산
-            dist, _    = fastdtw(ref_seq, live_seq, dist=frame_dist, radius=5)
-            avg_dist   = dist / max(len(ref_seq), len(live_seq), 1)
+            dist, _ = fastdtw(ref_seq, live_seq, dist=frame_dist, radius=5)
+            avg_dist = dist / max(len(ref_seq), len(live_seq), 1)
             similarity = max(0.0, 1.0 - avg_dist)
 
             # 이동량 페널티
-            ref_mv  = compute_seq_movement_vec(ref_seq, w_vec)
+            ref_mv = compute_seq_movement_vec(ref_seq, w_vec)
             live_mv = compute_seq_movement_vec(live_seq, w_vec)
             if ref_mv < STATIC_MOVEMENT_THRESHOLD:
                 ok = (similarity >= SIMILARITY_THRESHOLD)
             else:
                 move_ratio = live_mv / ref_mv if ref_mv > 0 else 0.0
-                ok = (similarity >= SIMILARITY_THRESHOLD and move_ratio >= MIN_MOVEMENT_RATIO)
+                ok = (similarity >= SIMILARITY_THRESHOLD and move_ratio >=
+                      MIN_MOVEMENT_RATIO)
 
             # 결과 저장 (나중에 WARMUP_MS 이후만 계산)
             results.append((now_ms, ok))
 
             # 실시간 로그
             if ref_mv < STATIC_MOVEMENT_THRESHOLD:
-                print(f"[{now_ms:4d}ms] static – sim={similarity:.3f} → {'OK' if ok else '✗'}")
+                print(
+                    f"[{now_ms:4d}ms] static – sim={similarity:.3f} → {'OK' if ok else '✗'}")
             else:
-                print(f"[{now_ms:4d}ms] sim={similarity:.3f}, mv_ratio={move_ratio:.3f} → {'OK' if ok else '✗'}")
+                print(
+                    f"[{now_ms:4d}ms] sim={similarity:.3f}, mv_ratio={move_ratio:.3f} → {'OK' if ok else '✗'}")
 
     finally:
         cap.release()
@@ -195,8 +211,8 @@ async def async_test(client,data,rsp_id):
     print(f"\n초반 {WARMUP_MS/1000:.1f}초 제외 후, "
           f"스무딩 적용된 수행 비율: {ratio:.2%}")
 
-
-    result = client.publish(f'move/end/'+rsp_id, str(round(cal * ratio/100, 2))+','+userId, qos=2)
+    result = client.publish(f'move/end/'+rsp_id,
+                            str(cal * ratio)+','+userId, qos=1)
     if result.rc != mqtt_client.MQTT_ERR_SUCCESS:
         logger.error(f"❌ Publish failed (response): rc={result.rc}")
 
@@ -207,6 +223,7 @@ async def async_test(client,data,rsp_id):
 # 별도 스레드에서 돌아갈 asyncio 이벤트 루프 시작
 async_loop = asyncio.new_event_loop()
 threading.Thread(target=lambda: async_loop.run_forever(), daemon=True).start()
+
 
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
@@ -244,10 +261,11 @@ def on_message(client, userdata, msg):
             latest_async_data = False
 
             # 3) 비동기 함수 스케줄링
-            asyncio.run_coroutine_threadsafe(async_test(client,data,RSPID), async_loop)
+            asyncio.run_coroutine_threadsafe(
+                detect_pose(client, data, RSPID), async_loop)
         else:
             logger.info("💡 Async test already running, skipping...")
-            result = client.publish(f'response/{msg.topic}', 0, qos=2)
+            result = client.publish(f'response/{msg.topic}', 0, qos=1)
             if result.rc != mqtt_client.MQTT_ERR_SUCCESS:
                 logger.error(f"❌ Publish failed (response): rc={result.rc}")
 
@@ -260,10 +278,10 @@ def run():
     client = mqtt_client.Client(client_id=CLIENT_ID)
     client.reconnect_delay_set(min_delay=1, max_delay=5)
 
-    client.on_connect    = on_connect
+    client.on_connect = on_connect
     client.on_disconnect = on_disconnect
-    client.on_message    = on_message
-    client.on_log        = on_log
+    client.on_message = on_message
+    client.on_log = on_log
 
     # 초기 연결 시도 (성공할 때까지 5초 간격 재시도)
     while True:
@@ -271,7 +289,8 @@ def run():
             client.connect(BROKER, PORT)
             break
         except Exception as e:
-            logger.warning(f"⚠️ Initial connection failed: {e}. Retrying in 5s...")
+            logger.warning(
+                f"⚠️ Initial connection failed: {e}. Retrying in 5s...")
             time.sleep(5)
 
     # 네트워크 루프 백그라운드 실행
@@ -291,6 +310,7 @@ def run():
     finally:
         client.loop_stop()
         client.disconnect()
+
 
 if __name__ == '__main__':
     run()
