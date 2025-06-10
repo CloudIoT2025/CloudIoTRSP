@@ -1,10 +1,8 @@
 {
-  "broker": "broker ip",
+  "broker": "broker adrr",
   "port": "port",
   "rspId": "12345",
-  "data_url":{
-    "1": "https://s3. ------ /1.json",
-    "2": "https://s3. ------ /2.json",
-    "3": "https://s3. ------ /3.json",
-  }
+  "cert_filepath":"cert.pem",
+  "pri_key_filepath":"private.key",
+  "ca_filepath": "root-CA.crt"
 }
